@@ -1,0 +1,132 @@
+name: Build and Deploy Shopix
+
+on:
+    push:
+        branches:
+            - main
+
+env:
+    AWS_REGION: us-east-1
+    ECR_REPOSITORY: shopix
+
+jobs:
+    deploy:
+        runs-on: ubuntu-latest
+        permissions:
+            id-token: write
+            contents: read
+
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v4
+
+            - name: Configure AWS credentials via OIDC
+              uses: aws-actions/configure-aws-credentials@v4
+              with:
+                  role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/shopix-githubaction-role
+                  aws-region: ${{ env.AWS_REGION }}
+
+            - name: Login to ECR
+              id: login-ecr
+              uses: aws-actions/amazon-ecr-login@v2
+
+            - name: Debug secrets and environment
+              env:
+                  ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+                  NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY: ${{ secrets.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY }}
+                  NEXT_PUBLIC_PUSHER_KEY: ${{ secrets.NEXT_PUBLIC_PUSHER_KEY }}
+                  NEXT_PUBLIC_PUSHER_CLUSTER: ${{ secrets.NEXT_PUBLIC_PUSHER_CLUSTER }}
+              run: |
+                  echo "ECR Registry: $ECR_REGISTRY"
+                  echo "STRIPE key length: ${#NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY}"
+                  echo "PUSHER key length: ${#NEXT_PUBLIC_PUSHER_KEY}"
+                  echo "PUSHER cluster length: ${#NEXT_PUBLIC_PUSHER_CLUSTER}"
+
+            - name: Build and push image
+              env:
+                  ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+                  IMAGE_TAG: ${{ github.sha }}
+              run: |
+                  docker build \
+                    --build-arg NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY="${{ secrets.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY }}" \
+                    --build-arg NEXT_PUBLIC_PUSHER_KEY="${{ secrets.NEXT_PUBLIC_PUSHER_KEY }}" \
+                    --build-arg NEXT_PUBLIC_PUSHER_CLUSTER="${{ secrets.NEXT_PUBLIC_PUSHER_CLUSTER }}" \
+                    -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+                    -t $ECR_REGISTRY/$ECR_REPOSITORY:latest \
+                    $(pwd)
+                  docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+                  docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+            - name: Deploy to app-server-1
+              env:
+                  ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+              run: |
+                  # 1. Fetch Instance ID first to avoid nested variable issues
+                  INSTANCE_ID=$(aws ec2 describe-instances \
+                    --filters "Name=tag:Name,Values=app-server-1" "Name=instance-state-name,Values=running" \
+                    --query "Reservations[0].Instances[0].InstanceId" \
+                    --output text)
+
+                  # 2. Send SSM Command (Cleaned up quotes and fixed sahopix typo)
+                  COMMAND_ID=$(aws ssm send-command \
+                    --region "${{ env.AWS_REGION }}" \
+                    --instance-ids "$INSTANCE_ID" \
+                    --document-name "AWS-RunShellScript" \
+                    --parameters commands="[
+                      \"aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin $ECR_REGISTRY\",
+                      \"docker pull $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:latest\",
+                      \"docker stop shopix || true\",
+                      \"docker rm shopix || true\",
+                      \"docker run -d --name shopix -p 80:3000 --restart always --env-file /home/ubuntu/.env.production $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:latest\"
+                    ]" \
+                    --query "Command.CommandId" \
+                    --output text)
+
+                  echo "Sent command $COMMAND_ID to instance $INSTANCE_ID. Waiting for execution..."
+
+                  # 3. Use '|| true' on the waiter so the workflow doesn't crash before showing logs
+                  aws ssm wait command-executed \
+                    --command-id "$COMMAND_ID" \
+                    --instance-id "$INSTANCE_ID" || true
+
+                  # 4. Get logs regardless of success or failure
+                  aws ssm get-command-invocation \
+                    --command-id "$COMMAND_ID" \
+                    --instance-id "$INSTANCE_ID" \
+                    --query "[Status, StandardOutputContent, StandardErrorContent]" \
+                    --output text
+
+            - name: Deploy to app-server-2
+              env:
+                  ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+              run: |
+                  INSTANCE_ID=$(aws ec2 describe-instances \
+                    --filters "Name=tag:Name,Values=app-server-2" "Name=instance-state-name,Values=running" \
+                    --query "Reservations[0].Instances[0].InstanceId" \
+                    --output text)
+
+                  COMMAND_ID=$(aws ssm send-command \
+                    --region "${{ env.AWS_REGION }}" \
+                    --instance-ids "$INSTANCE_ID" \
+                    --document-name "AWS-RunShellScript" \
+                    --parameters commands="[
+                      \"aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin $ECR_REGISTRY\",
+                      \"docker pull $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:latest\",
+                      \"docker stop shopix || true\",
+                      \"docker rm shopix || true\",
+                      \"docker run -d --name shopix -p 3000:3000 --restart always --env-file /home/ubuntu/.env.production $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:latest\"
+                    ]" \
+                    --query "Command.CommandId" \
+                    --output text)
+
+                  echo "Sent command $COMMAND_ID to instance $INSTANCE_ID. Waiting for execution..."
+
+                  aws ssm wait command-executed \
+                    --command-id "$COMMAND_ID" \
+                    --instance-id "$INSTANCE_ID" || true
+
+                  aws ssm get-command-invocation \
+                    --command-id "$COMMAND_ID" \
+                    --instance-id "$INSTANCE_ID" \
+                    --query "[Status, StandardOutputContent, StandardErrorContent]" \
+                    --output text
