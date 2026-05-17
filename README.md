@@ -8,6 +8,8 @@
 
 **URL:** http://prod-lb-1497452199.us-east-1.elb.amazonaws.com
 
+![Architecture Diagram](setup_media/architecture-diagram.png)
+
 ![Shopix Homepage](setup_media/shopix-homepage.jpeg)
 ![Shopix Login](setup_media/shopix-login.jpeg)
 
